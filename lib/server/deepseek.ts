@@ -85,6 +85,7 @@ async function requestJson(
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
   userId: string,
   maxTokens: number,
+  useJsonMode = true,
 ): Promise<unknown> {
   const runtime = getRuntimeEnv();
   if (!runtime.DEEPSEEK_API_KEY) throw new Error("MODEL_NOT_CONFIGURED");
@@ -92,29 +93,41 @@ async function requestJson(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25_000);
   try {
+    const requestBody: Record<string, unknown> = {
+      model: runtime.DEEPSEEK_MODEL || "deepseek-v4-flash",
+      messages,
+      thinking: { type: "disabled" },
+      temperature: 0.45,
+      max_tokens: maxTokens,
+      user_id: userId,
+    };
+    if (useJsonMode) requestBody.response_format = { type: "json_object" };
+
     const response = await fetch("https://api.deepseek.com/chat/completions", {
       method: "POST",
       headers: {
         authorization: `Bearer ${runtime.DEEPSEEK_API_KEY}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        model: runtime.DEEPSEEK_MODEL || "deepseek-v4-flash",
-        messages,
-        thinking: { type: "disabled" },
-        temperature: 0.55,
-        max_tokens: maxTokens,
-        response_format: { type: "json_object" },
-        user_id: userId,
-      }),
+      body: JSON.stringify(requestBody),
       signal: controller.signal,
     });
     if (!response.ok) throw new Error(`MODEL_HTTP_${response.status}`);
     const payload = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string | null } }>;
+      choices?: Array<{
+        finish_reason?: string;
+        message?: { content?: string | null; reasoning_content?: string | null };
+      }>;
     };
-    const content = payload.choices?.[0]?.message?.content?.trim();
-    if (!content) throw new Error("MODEL_EMPTY_RESPONSE");
+    const choice = payload.choices?.[0];
+    const content = choice?.message?.content?.trim();
+    if (!content) {
+      console.error("[deepseek-empty]", {
+        finishReason: choice?.finish_reason,
+        hasReasoning: Boolean(choice?.message?.reasoning_content),
+      });
+      throw new Error("MODEL_EMPTY_RESPONSE");
+    }
     return safeJsonParse(content);
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
@@ -168,9 +181,14 @@ ${memoryBlock(input.memories)}
       ["MODEL_EMPTY_RESPONSE", "MODEL_INVALID_JSON"].includes(error.message)
     ) {
       raw = await requestJson(
-        [{ role: "system", content: system }, ...recentMessages],
+        [
+          { role: "system", content: system },
+          ...recentMessages,
+          { role: "user", content: "请严格按照上面的字段输出一个 JSON 对象。" },
+        ],
         input.userId,
         900,
+        false,
       );
     } else {
       throw error;
@@ -235,11 +253,31 @@ ${memoryBlock(input.existingMemories)}
 
 本次对话：
 ${transcript}`;
-  const raw = await requestJson(
-    [{ role: "system", content: system }, { role: "user", content: "请整理为 JSON。" }],
-    input.userId,
-    700,
-  );
+  const extractionMessages = [
+    { role: "system" as const, content: system },
+    { role: "user" as const, content: "请整理为 JSON。" },
+  ];
+  let raw: unknown;
+  try {
+    raw = await requestJson(extractionMessages, input.userId, 700);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      ["MODEL_EMPTY_RESPONSE", "MODEL_INVALID_JSON"].includes(error.message)
+    ) {
+      raw = await requestJson(
+        [
+          ...extractionMessages,
+          { role: "user", content: "不要解释，只输出可解析的 JSON 对象。" },
+        ],
+        input.userId,
+        700,
+        false,
+      );
+    } else {
+      throw error;
+    }
+  }
   if (!raw || typeof raw !== "object") throw new Error("MODEL_INVALID_JSON");
   const record = raw as Record<string, unknown>;
   const title = text(record.title, 24) || "一次职场情绪整理";

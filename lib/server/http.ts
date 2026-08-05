@@ -24,6 +24,14 @@ export function publicError(error: unknown): {
 
 export function errorResponse(error: unknown, identity?: Identity): Response {
   const result = publicError(error);
+  console.error("[api-error]", {
+    code: error instanceof Error ? error.message : "UNKNOWN_ERROR",
+    cause:
+      error instanceof Error && error.cause instanceof Error
+        ? error.cause.message
+        : undefined,
+    at: new Date().toISOString(),
+  });
   if (identity) {
     return jsonWithIdentity(identity, { error: result }, { status: result.status });
   }
